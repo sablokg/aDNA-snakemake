@@ -1,0 +1,12 @@
+# Driver environment: only Snakemake itself. Every tool used by the rules
+# is installed automatically into its own env from envs/*.yaml.
+name: adna-snakemake
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - python>=3.11
+  - snakemake>=8.4
+  - pandas
+  - mamba

@@ -1,0 +1,40 @@
+# ---- inputs ----------------------------------------------------------------
+samples: config/samples.tsv
+outdir: results
+ref: /path/to/hs37d5.fa            # bwa/faidx indexes are created next to it if missing
+
+# SNP panel for pseudo-haploid genotyping (leave "" to skip genotyping).
+# Contig names must match the reference (e.g. 1240k on hs37d5 uses 1..22,X,Y).
+panel_bed: ""                      # BED of panel positions (chrom, pos0, pos1)
+panel_snp: ""                      # EIGENSTRAT .snp file of the panel
+
+# ---- contig names ----------------------------------------------------------
+mt_name: MT
+x_name: X
+y_name: Y
+
+# ---- trimming / merging ----------------------------------------------------
+adapter1: AGATCGGAAGAGCACACGTCTGAACTCCAGTCA
+adapter2: AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT
+min_len: 30
+min_trim_quality: 20
+
+# ---- mapping (Schubert et al. 2012 aDNA settings) ---------------------------
+bwa_l: 1024
+bwa_n: 0.01
+bwa_o: 2
+
+# ---- filtering -------------------------------------------------------------
+min_mapq: 30
+min_map_len: 35                    # minimum alignment length on reference
+min_bq: 30                         # base quality for pileupCaller
+
+# ---- damage masking --------------------------------------------------------
+# Terminal bases soft-clipped from both read ends:
+#   non-UDG: 10   UDG-half: 2   full UDG: 0
+trim_bp: 2
+
+# ---- mitochondrial haplogroup ----------------------------------------------
+run_haplogroup: true
+haplogrep_tree: phylotree-rcrs@17.1   # downloaded on first use (needs internet)
+mt_min_depth: 3

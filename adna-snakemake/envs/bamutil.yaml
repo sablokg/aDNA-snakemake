@@ -1,0 +1,4 @@
+channels: [conda-forge, bioconda, nodefaults]
+dependencies:
+  - bamutil>=1.0.15
+  - samtools>=1.17

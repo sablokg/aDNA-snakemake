@@ -1,0 +1,394 @@
+# =============================================================================
+# Ancient DNA pipeline: FASTQ -> filtered/damage-masked BAM -> QC -> genotypes
+#
+#   snakemake --use-conda --cores 16                      (Snakemake 7)
+#   snakemake --software-deployment-method conda --cores 16   (Snakemake 8+)
+#
+# Every rule runs in its own small conda env (envs/*.yaml).
+# =============================================================================
+import os
+import pandas as pd
+
+configfile: "config/config.yaml"
+
+OUT = config["outdir"].rstrip("/")
+REF = config["ref"]
+
+# ----------------------------- sample sheet ----------------------------------
+samples = pd.read_csv(config["samples"], sep="\t", dtype=str,
+                      comment="#", keep_default_na=False)
+missing = {"sample", "fq1", "fq2", "library"} - set(samples.columns)
+if missing:
+    raise ValueError(f"samples.tsv is missing columns: {sorted(missing)}")
+if not samples["library"].isin(["ds", "ss"]).all():
+    raise ValueError("library column must be 'ds' or 'ss'")
+if samples["sample"].duplicated().any():
+    raise ValueError("duplicate sample IDs in samples.tsv")
+
+samples = samples.set_index("sample", drop=False)
+SAMPLES = list(samples.index)
+LIBS = {lib: list(df.index) for lib, df in samples.groupby("library")}
+
+GENO = bool(config.get("panel_bed")) and bool(config.get("panel_snp"))
+HAPLO = bool(config.get("run_haplogroup", True))
+
+wildcard_constraints:
+    sample="[^/]+",
+    lib="ds|ss",
+
+
+def fq2(wc):
+    v = samples.loc[wc.sample, "fq2"]
+    return "" if v in ("", "NA") else v
+
+
+def trim_inputs(wc):
+    files = [samples.loc[wc.sample, "fq1"]]
+    if fq2(wc):
+        files.append(fq2(wc))
+    return files
+
+
+def lib_bams(wc):
+    return expand(OUT + "/final/{s}.final.bam", s=LIBS[wc.lib])
+
+
+def lib_bais(wc):
+    return expand(OUT + "/final/{s}.final.bam.bai", s=LIBS[wc.lib])
+
+
+# ----------------------------- targets ---------------------------------------
+rule all:
+    input:
+        OUT + "/stats/summary.tsv",
+        OUT + "/stats/multiqc_report.html",
+        expand(OUT + "/damage/{sample}/misincorporation.txt", sample=SAMPLES),
+        expand(OUT + "/mt/{sample}.haplogrep.txt", sample=SAMPLES) if HAPLO else [],
+        multiext(OUT + "/geno/all_samples", ".geno", ".snp", ".ind") if GENO else [],
+
+
+# ----------------------------- reference -------------------------------------
+rule bwa_index:
+    input: REF
+    output: multiext(REF, ".amb", ".ann", ".bwt", ".pac", ".sa")
+    conda: "envs/map.yaml"
+    log: OUT + "/logs/bwa_index.log"
+    shell: "bwa index {input} > {log} 2>&1"
+
+
+rule faidx:
+    input: REF
+    output: REF + ".fai"
+    conda: "envs/map.yaml"
+    shell: "samtools faidx {input}"
+
+
+rule bam_index:
+    input: "{prefix}.bam"
+    output: "{prefix}.bam.bai"
+    conda: "envs/map.yaml"
+    threads: 2
+    shell: "samtools index -@ {threads} {input}"
+
+
+# ----------------------------- QC / trimming ---------------------------------
+rule fastqc:
+    input: trim_inputs
+    output: directory(OUT + "/fastqc/{sample}")
+    conda: "envs/qc.yaml"
+    threads: 2
+    log: OUT + "/logs/fastqc/{sample}.log"
+    shell:
+        "mkdir -p {output} && fastqc -q -t {threads} -o {output} {input} > {log} 2>&1"
+
+
+rule trim_merge:
+    """AdapterRemoval: trim adapters; merge pairs (PE) or trim only (SE).
+    PE output keeps both .collapsed and .collapsed.truncated reads; unmerged pairs are dropped."""
+    input: trim_inputs
+    output:
+        fq=OUT + "/trim/{sample}.merged.fq.gz",
+        settings=OUT + "/trim/{sample}.settings",
+    params:
+        pe=lambda wc: 1 if fq2(wc) else 0,
+        r2=lambda wc: fq2(wc),
+        prefix=OUT + "/trim/{sample}",
+        a1=config["adapter1"],
+        a2=config["adapter2"],
+        minlen=config["min_len"],
+        minq=config["min_trim_quality"],
+    conda: "envs/trim.yaml"
+    threads: 4
+    log: OUT + "/logs/trim/{sample}.log"
+    shell:
+        r"""
+        if [ "{params.pe}" = "1" ]; then
+            AdapterRemoval --file1 {input[0]} --file2 {params.r2} --basename {params.prefix} \
+                --adapter1 {params.a1} --adapter2 {params.a2} \
+                --collapse --trimns --trimqualities --minquality {params.minq} \
+                --minlength {params.minlen} --threads {threads} --gzip > {log} 2>&1
+            cat {params.prefix}.collapsed.gz {params.prefix}.collapsed.truncated.gz > {output.fq}
+            rm -f {params.prefix}.collapsed.gz {params.prefix}.collapsed.truncated.gz \
+                  {params.prefix}.pair1.truncated.gz {params.prefix}.pair2.truncated.gz \
+                  {params.prefix}.singleton.truncated.gz {params.prefix}.discarded.gz
+        else
+            AdapterRemoval --file1 {input[0]} --basename {params.prefix} \
+                --adapter1 {params.a1} \
+                --trimns --trimqualities --minquality {params.minq} \
+                --minlength {params.minlen} --threads {threads} --gzip > {log} 2>&1
+            mv {params.prefix}.truncated.gz {output.fq}
+            rm -f {params.prefix}.discarded.gz
+        fi
+        """
+
+
+# ----------------------------- mapping ---------------------------------------
+rule bwa_aln:
+    input:
+        fq=OUT + "/trim/{sample}.merged.fq.gz",
+        ref=REF,
+        idx=multiext(REF, ".amb", ".ann", ".bwt", ".pac", ".sa"),
+    output: temp(OUT + "/map/{sample}.sai")
+    params:
+        l=config["bwa_l"], n=config["bwa_n"], o=config["bwa_o"],
+    conda: "envs/map.yaml"
+    threads: 8
+    log: OUT + "/logs/map/{sample}.aln.log"
+    shell:
+        "bwa aln -t {threads} -l {params.l} -n {params.n} -o {params.o} "
+        "{input.ref} {input.fq} > {output} 2> {log}"
+
+
+rule bwa_samse:
+    input:
+        sai=OUT + "/map/{sample}.sai",
+        fq=OUT + "/trim/{sample}.merged.fq.gz",
+        ref=REF,
+        fai=REF + ".fai",
+    output: temp(OUT + "/map/{sample}.raw.bam")
+    params:
+        rg=lambda wc: f"@RG\\tID:{wc.sample}\\tSM:{wc.sample}\\tLB:{wc.sample}\\tPL:ILLUMINA",
+    conda: "envs/map.yaml"
+    threads: 4
+    log: OUT + "/logs/map/{sample}.samse.log"
+    shell:
+        "bwa samse -r '{params.rg}' {input.ref} {input.sai} {input.fq} 2> {log} "
+        "| samtools sort -@ {threads} -o {output} -"
+
+
+rule filter_bam:
+    """Mapped reads only, MAPQ and minimum alignment length."""
+    input: OUT + "/map/{sample}.raw.bam"
+    output: temp(OUT + "/map/{sample}.filt.bam")
+    params:
+        q=config["min_mapq"], minlen=config["min_map_len"],
+    conda: "envs/map.yaml"
+    threads: 4
+    shell:
+        "samtools view -@ {threads} -b -F 4 -q {params.q} -e 'rlen>={params.minlen}' "
+        "-o {output} {input}"
+
+
+rule dedup:
+    """Duplicate removal on 5' position + strand (see README note for merged reads)."""
+    input: OUT + "/map/{sample}.filt.bam"
+    output:
+        bam=OUT + "/dedup/{sample}.dedup.bam",
+        stats=OUT + "/dedup/{sample}.markdup.txt",
+    conda: "envs/map.yaml"
+    threads: 4
+    shell:
+        "samtools sort -n -@ {threads} {input} "
+        "| samtools fixmate -m -@ {threads} - - "
+        "| samtools sort -@ {threads} - "
+        "| samtools markdup -r -s -f {output.stats} -@ {threads} - {output.bam}"
+
+
+# ----------------------------- damage ----------------------------------------
+rule mapdamage:
+    input:
+        bam=OUT + "/dedup/{sample}.dedup.bam",
+        bai=OUT + "/dedup/{sample}.dedup.bam.bai",
+        ref=REF,
+    output:
+        OUT + "/damage/{sample}/misincorporation.txt",
+        OUT + "/damage/{sample}/5pCtoT_freq.txt",
+    params:
+        d=OUT + "/damage/{sample}",
+    conda: "envs/damage.yaml"
+    log: OUT + "/logs/damage/{sample}.log"
+    shell:
+        "mapDamage -i {input.bam} -r {input.ref} -d {params.d} "
+        "--merge-reference-sequences --no-stats > {log} 2>&1"
+
+
+rule trim_ends:
+    """Soft-clip terminal bases to mask post-mortem damage."""
+    input:
+        bam=OUT + "/dedup/{sample}.dedup.bam",
+        bai=OUT + "/dedup/{sample}.dedup.bam.bai",
+    output: OUT + "/final/{sample}.final.bam"
+    params:
+        n=config["trim_bp"],
+        tmp=OUT + "/final/{sample}.trim.tmp.bam",
+    conda: "envs/bamutil.yaml"
+    threads: 4
+    log: OUT + "/logs/final/{sample}.log"
+    shell:
+        r"""
+        if [ "{params.n}" -gt 0 ]; then
+            bam trimBam {input.bam} {params.tmp} -L {params.n} -R {params.n} --clip > {log} 2>&1
+            samtools sort -@ {threads} -o {output} {params.tmp}
+            rm -f {params.tmp}
+        else
+            cp {input.bam} {output}
+        fi
+        """
+
+
+# ----------------------------- stats -----------------------------------------
+rule bam_stats:
+    input:
+        bam=OUT + "/final/{sample}.final.bam",
+        bai=OUT + "/final/{sample}.final.bam.bai",
+    output:
+        flagstat=OUT + "/stats/{sample}.flagstat.txt",
+        idxstats=OUT + "/stats/{sample}.idxstats.txt",
+    conda: "envs/map.yaml"
+    shell:
+        "samtools flagstat {input.bam} > {output.flagstat} && "
+        "samtools idxstats {input.bam} > {output.idxstats}"
+
+
+rule sample_stats:
+    input:
+        fq1=lambda wc: samples.loc[wc.sample, "fq1"],
+        merged=OUT + "/trim/{sample}.merged.fq.gz",
+        filt=OUT + "/map/{sample}.filt.bam",
+        dedup=OUT + "/dedup/{sample}.dedup.bam",
+        final=OUT + "/final/{sample}.final.bam",
+        bai=OUT + "/final/{sample}.final.bam.bai",
+    output: temp(OUT + "/stats/{sample}.line.tsv")
+    params:
+        script=os.path.join(workflow.basedir, "scripts", "sample_stats.sh"),
+        lib=lambda wc: samples.loc[wc.sample, "library"],
+        mt=config["mt_name"], x=config["x_name"], y=config["y_name"],
+    conda: "envs/map.yaml"
+    shell:
+        "bash {params.script} {wildcards.sample} {params.lib} {input.fq1} {input.merged} "
+        "{input.filt} {input.dedup} {input.final} {params.mt} {params.x} {params.y} {output}"
+
+
+rule summary:
+    input: expand(OUT + "/stats/{sample}.line.tsv", sample=SAMPLES)
+    output: OUT + "/stats/summary.tsv"
+    shell:
+        r"""
+        printf 'sample\tlib\traw_reads\tmerged_reads\tmapped_q\tendogenous_pct\tunique_reads\tdup_rate\tmean_len\tmean_depth\tcov_1x_pct\tRy\tsex\tmt_depth\n' > {output}
+        cat {input} >> {output}
+        """
+
+
+rule multiqc:
+    input:
+        expand(OUT + "/fastqc/{sample}", sample=SAMPLES),
+        expand(OUT + "/trim/{sample}.settings", sample=SAMPLES),
+        expand(OUT + "/stats/{sample}.flagstat.txt", sample=SAMPLES),
+        expand(OUT + "/stats/{sample}.idxstats.txt", sample=SAMPLES),
+        expand(OUT + "/dedup/{sample}.markdup.txt", sample=SAMPLES),
+    output: OUT + "/stats/multiqc_report.html"
+    params:
+        outdir=OUT + "/stats",
+        dirs=[OUT + "/fastqc", OUT + "/trim", OUT + "/stats", OUT + "/dedup"],
+    conda: "envs/qc.yaml"
+    log: OUT + "/logs/multiqc.log"
+    shell:
+        "multiqc -f -o {params.outdir} -n multiqc_report.html {params.dirs} > {log} 2>&1"
+
+
+# ----------------------------- mitochondrial haplogroup ----------------------
+rule mt_vcf:
+    input:
+        bam=OUT + "/final/{sample}.final.bam",
+        bai=OUT + "/final/{sample}.final.bam.bai",
+        ref=REF,
+        fai=REF + ".fai",
+    output: OUT + "/mt/{sample}.vcf"
+    params:
+        mt=config["mt_name"], mindp=config["mt_min_depth"],
+    conda: "envs/mt.yaml"
+    log: OUT + "/logs/mt/{sample}.vcf.log"
+    shell:
+        "bcftools mpileup -f {input.ref} -r {params.mt} -q 30 -Q 20 -a FORMAT/AD,FORMAT/DP "
+        "{input.bam} 2> {log} "
+        "| bcftools call -mv --ploidy 1 2>> {log} "
+        "| bcftools filter -i 'INFO/DP>={params.mindp} && QUAL>=30' -Ov -o {output} 2>> {log}"
+
+
+rule haplogrep:
+    input: OUT + "/mt/{sample}.vcf"
+    output: OUT + "/mt/{sample}.haplogrep.txt"
+    params:
+        tree=config["haplogrep_tree"],
+    conda: "envs/mt.yaml"
+    log: OUT + "/logs/mt/{sample}.haplogrep.log"
+    shell:
+        "haplogrep3 classify --tree {params.tree} --input {input} --output {output} > {log} 2>&1"
+
+
+# ----------------------------- genotyping ------------------------------------
+rule pileupcaller:
+    """Pseudo-haploid calls at panel sites. One run per library type, because
+    single-stranded libraries need --singleStrandMode."""
+    input:
+        bams=lib_bams,
+        bais=lib_bais,
+        ref=REF,
+        fai=REF + ".fai",
+        bed=config.get("panel_bed") or [],
+        snp=config.get("panel_snp") or [],
+    output: multiext(OUT + "/geno/{lib}", ".geno", ".snp", ".ind")
+    params:
+        prefix=OUT + "/geno/{lib}",
+        names=lambda wc: ",".join(LIBS[wc.lib]),
+        mode=lambda wc: "--singleStrandMode" if wc.lib == "ss" else "",
+        q=config["min_mapq"], bq=config["min_bq"],
+    conda: "envs/geno.yaml"
+    log: OUT + "/logs/geno/{lib}.log"
+    shell:
+        "samtools mpileup -R -B -q {params.q} -Q {params.bq} -l {input.bed} -f {input.ref} "
+        "{input.bams} 2> {log} "
+        "| pileupCaller --randomHaploid {params.mode} --sampleNames {params.names} "
+        "-f {input.snp} -e {params.prefix} 2>> {log}"
+
+
+rule merge_geno:
+    """Merge ds and ss EIGENSTRAT sets (or pass through if only one library type)."""
+    input:
+        geno=expand(OUT + "/geno/{lib}.geno", lib=sorted(LIBS)),
+        snp=expand(OUT + "/geno/{lib}.snp", lib=sorted(LIBS)),
+        ind=expand(OUT + "/geno/{lib}.ind", lib=sorted(LIBS)),
+    output: multiext(OUT + "/geno/all_samples", ".geno", ".snp", ".ind")
+    params:
+        n=len(LIBS),
+        par=OUT + "/geno/merge.par",
+        prefix=OUT + "/geno/all_samples",
+    conda: "envs/eigensoft.yaml"
+    log: OUT + "/logs/geno/merge.log"
+    shell:
+        r"""
+        if [ "{params.n}" -eq 2 ]; then
+            printf '%s\n' \
+              "geno1: {input.geno[0]}" "snp1: {input.snp[0]}" "ind1: {input.ind[0]}" \
+              "geno2: {input.geno[1]}" "snp2: {input.snp[1]}" "ind2: {input.ind[1]}" \
+              "genooutfilename: {params.prefix}.geno" \
+              "snpoutfilename: {params.prefix}.snp" \
+              "indoutfilename: {params.prefix}.ind" \
+              "outputformat: EIGENSTRAT" "docheck: NO" "hashcheck: NO" > {params.par}
+            mergeit -p {params.par} > {log} 2>&1
+        else
+            cp {input.geno[0]} {output[0]}
+            cp {input.snp[0]}  {output[1]}
+            cp {input.ind[0]}  {output[2]}
+        fi
+        """
