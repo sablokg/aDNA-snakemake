@@ -1,4 +1,4 @@
-# adna-snakemake
+# aDNA-snakemake
 
 A Snakemake pipeline for **ancient DNA (aDNA)** shotgun / capture data. It takes raw FASTQ files and produces damage-masked, filtered BAMs, QC reports, mitochondrial haplogroups, genetic sex estimates and (optionally) pseudo-haploid genotypes at a SNP panel such as 1240k.
 
@@ -403,3 +403,6 @@ Each step writes its stdout/stderr to `results/logs/...`, which is the first pla
 - Skoglund et al. 2013, *Accurate sex identification of ancient human remains using DNA shotgun sequencing*, J Archaeol Sci.
 - Jónsson et al. 2013, *mapDamage2.0*, Bioinformatics.
 - Mölder et al. 2021, *Sustainable data analysis with Snakemake*, F1000Research.
+
+Gaurav Sablok \
+gsablok@proton.me
